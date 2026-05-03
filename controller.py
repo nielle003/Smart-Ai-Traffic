@@ -207,7 +207,21 @@ class NeuralNetworkAI:
             car_count = e + w
 
         duration = min(25.0, max(5.0, 5.0 + car_count * 2.0))
-        reason   = f"NN axis={axis}, formula duration={duration:.0f}s ({car_count} cars)"
+        reason = f"NN axis={axis}, formula duration={duration:.0f}s ({car_count} cars)"
+
+        # Override: never give green to an empty axis if the other has cars
+        ns_total = n + s
+        ew_total = e + w
+        if axis == 'NS' and ns_total == 0 and ew_total > 0:
+            axis      = 'EW'
+            car_count = ew_total
+            duration  = min(25.0, max(5.0, 5.0 + car_count * 2.0))
+            reason    = f"Override: NS empty, redirected to EW ({car_count} cars)"
+        elif axis == 'EW' and ew_total == 0 and ns_total > 0:
+            axis      = 'NS'
+            car_count = ns_total
+            duration  = min(25.0, max(5.0, 5.0 + car_count * 2.0))
+            reason    = f"Override: EW empty, redirected to NS ({car_count} cars)"
 
         # Hard override 1: max wait exceeded
         if ew_wait >= MAX_WAIT and axis != 'EW':
