@@ -314,27 +314,6 @@ BATCH_SIZE = 128
 
 ---
 
-## Experimental Results
-
-### Training Configuration
-- **Episodes**: 8,000
-- **Steps per episode**: 60 (max 25 min simulation time)
-- **Convergence**: ~5,000 episodes (validated by reward plateau)
-
-### Expected Policy (Learned)
-The AI typically learns to:
-1. **Priority rule**: Give green to busier axis (reward: +1.5/car difference)
-2. **Duration rule**: Scale duration with traffic (5s for 0-2 cars, 25s for 10+ cars)
-3. **Wait rule**: If either axis >35s wait, override to that axis (penalty: -3.0/s)
-4. **Emergency rule**: Always serve emergency axis immediately (reward: ±15.0)
-
-### Performance Metrics
-- **Average wait time**: <20s (vs. 40s max with fixed timer)
-- **Throughput**: ~15% improvement over fixed 30s cycles (simulated)
-- **Safety compliance**: 100% (MAX_WAIT never exceeded due to override)
-
----
-
 ## Project Structure & Key Files
 
 ```
@@ -349,8 +328,15 @@ Smart-Ai-Traffic/
 │   ├── NeuralNetworkAI class   # Loads model_weights.npz
 │   └── Arduino class           # Serial communication (9600 baud)
 │
+├── benchmark.py                # Performance benchmarking tool
+│   ├── FixedTimerController    # Baseline controllers (20s, 30s, 40s)
+│   ├── AIController            # Loads trained model for comparison
+│   └── run_benchmark()        # Runs 100 episodes × 60 steps per controller
+│
 ├── model_weights.npz           # Trained model (6→32→32→22)
 ├── yolov8n.pt                 # YOLOv8 nano model (~6MB)
+├── benchmark_results.png       # Benchmark visualization output
+├── training_progress.png      # Training loss/reward curves
 │
 ├── traffic_light/
 │   └── traffic_light.ino       # Arduino firmware (12 LEDs, 4 lights)
@@ -377,6 +363,18 @@ python train.py
 python controller.py
 # Output: Real-time video feeds with vehicle counts + AI decisions
 ```
+
+---
+
+## Benchmark Results & Analysis
+
+For detailed performance metrics and methodology, see: **[BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md)**
+
+**Quick Summary:**
+- AI vs. Fixed 30s: **+27.6%** wait time reduction
+- AI vs. Fixed 40s: **+45.6%** wait time reduction  
+- Benchmark: 100 episodes × 60 steps, Poisson traffic model
+- Visualization: `benchmark_results.png`
 
 ---
 
