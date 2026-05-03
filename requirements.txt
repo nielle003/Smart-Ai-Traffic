@@ -1,0 +1,17 @@
+# Python Dependencies for 4-Way AI Traffic Controller
+# Install with: pip install -r requirements.txt
+
+# Computer Vision
+opencv-python>=4.8.0
+
+# Serial Communication (Arduino)
+pyserial>=3.7
+
+# Numerical Computing
+numpy>=1.24.0
+
+# YOLOv8 Object Detection
+ultralytics>=8.0.0
+
+# Training dependencies (train.py)
+matplotlib>=3.7.0
