@@ -106,18 +106,65 @@ def find_arduino():
 class Arduino:
     def __init__(self, port):
         print(f"[Arduino] Connecting on {port}...")
-        self.ser   = serial.Serial(port, BAUD_RATE, timeout=2)
-        self._lock = threading.Lock()
+        self.ser             = serial.Serial(port, BAUD_RATE, timeout=2)
+        self._cmd_lock       = threading.Lock()   # for sending commands
+        self.button_callback = None
+        self._stop           = False
         time.sleep(2)
-        print(f"[Arduino] {self.ser.readline().decode().strip()}")
+        self.ser.reset_input_buffer()
+        resp = self.ser.readline().decode().strip()
+        print(f"[Arduino] {resp}")
         self.both_red()
+        self._start_reader()   # start serial reader immediately
+
+    def _start_reader(self):
+        """
+        Dedicated thread that reads ALL incoming serial data.
+        Puts responses in a queue for _send() to collect.
+        Dispatches BTN: messages immediately to the callback.
+        This runs independently of YOLO — never misses a button press.
+        """
+        import queue
+        self._response_queue = queue.Queue()
+
+        def _read():
+            while not self._stop:
+                try:
+                    if self.ser.in_waiting:
+                        line = self.ser.readline().decode().strip()
+                        if not line:
+                            continue
+                        if line.startswith("BTN:"):
+                            # Button press — dispatch immediately
+                            label = line.split(":")[1]
+                            if self.button_callback:
+                                self.button_callback(label)
+                        else:
+                            # Command response (OK, ERR, READY) — queue it
+                            self._response_queue.put(line)
+                except Exception:
+                    pass
+                time.sleep(0.005)
+
+        t = threading.Thread(target=_read, daemon=True)
+        t.start()
 
     def _send(self, cmd):
-        with self._lock:
-            self.ser.write((cmd+"\n").encode())
-            r = self.ser.readline().decode().strip()
-            if r != "OK":
-                print(f"[Arduino] Warning: '{r}' for '{cmd}'")
+        """Send command, wait for OK from the response queue."""
+        with self._cmd_lock:
+            self.ser.write((cmd + "\n").encode())
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                try:
+                    r = self._response_queue.get(timeout=0.1)
+                    if r == "OK":
+                        return
+                except Exception:
+                    pass
+            print(f"[Arduino] Warning: timeout on '{cmd}'")
+
+    def set_button_callback(self, fn):
+        self.button_callback = fn
 
     def set_ns(self, state): self._send(f"NS:{state}")
     def set_ew(self, state): self._send(f"EW:{state}")
@@ -125,8 +172,50 @@ class Arduino:
     def pedestrian(self):    self._send("PEDESTRIAN")
 
     def close(self):
+        self._stop = True
         self.both_red()
         self.ser.close()
+
+
+# ── Pedestrian queue ──────────────────────────────────────────────────────────
+
+class PedestrianQueue:
+    def __init__(self):
+        self._lock      = threading.Lock()
+        self.requested  = False
+        self.buttons    = set()
+        self.last_press = 0.0   # timestamp of most recent button press
+
+    def press(self, direction):
+        with self._lock:
+            self.requested  = True
+            self.last_press = time.time()
+            self.buttons.add(direction)
+            print(f"[PED] Button pressed: {direction} — queued for next safe gap")
+
+    def consume(self):
+        with self._lock:
+            if self.requested:
+                dirs = ', '.join(sorted(self.buttons))
+                print(f"[PED] Serving pedestrian request from: {dirs}")
+                self.requested = False
+                self.buttons.clear()
+                return True
+            return False
+
+    @property
+    def pending(self):
+        return self.requested
+
+    @property
+    def recently_pressed(self):
+        """True for 2 seconds after any button press — for visual flash."""
+        return (time.time() - self.last_press) < 2.0
+
+    @property
+    def pressed_directions(self):
+        with self._lock:
+            return set(self.buttons)
 
 # ── Vehicle detector ──────────────────────────────────────────────────────────
 
@@ -138,7 +227,7 @@ class Detector:
         if Detector._model is None:
             from ultralytics import YOLO
             print("[YOLO] Loading YOLOv8n...")
-            Detector._model = YOLO("yolov8n.pt")
+            Detector._model = YOLO("vision-mk01.pt")
             print("[YOLO] Ready.")
 
     def count(self, frame):
@@ -269,14 +358,15 @@ class SignalCycle:
       PEDESTRIAN inserted every PED_EVERY_N_CYCLES decisions.
     """
 
-    def __init__(self, arduino, ai):
+    def __init__(self, arduino, ai, ped_queue):
         self.arduino    = arduino
         self.ai         = ai
+        self.ped_queue  = ped_queue
         self.phase      = "INIT"
         self.phase_end  = 0.0
-        self.decisions  = 0      # total AI decisions made
-        self.ns_wait    = 0.0    # how long NS has been waiting (on red)
-        self.ew_wait    = 0.0    # how long EW has been waiting (on red)
+        self.decisions  = 0
+        self.ns_wait    = 0.0
+        self.ew_wait    = 0.0
         self.current_axis = "NS"
         self.info       = "Starting..."
         self._go("DECIDE")
@@ -349,8 +439,8 @@ class SignalCycle:
             self._go("ALL_RED")
 
         elif self.phase == "ALL_RED":
-            # Check if pedestrian phase is due
-            if self.decisions > 0 and self.decisions % PED_EVERY_N_CYCLES == 0:
+            # Serve pedestrian if button was pressed, otherwise continue
+            if self.ped_queue.consume():
                 self._go("PEDESTRIAN")
             else:
                 self._go("DECIDE")
@@ -390,6 +480,9 @@ class SignalCycle:
             "decision":   self.ai.last_dec,
             "last_dur":   self.ai.last_dur,
             "last_axis":  self.ai.last_axis,
+            "ped_pending":   self.ped_queue.pending,
+            "ped_recent":    self.ped_queue.recently_pressed,
+            "ped_dirs":      self.ped_queue.pressed_directions,
             "N": c['N'], "S": c['S'], "E": c['E'], "W": c['W'],
         }
 
@@ -449,7 +542,34 @@ def draw_panel(s):
     cv2.putText(p,dec,(15,148),cv2.FONT_HERSHEY_SIMPLEX,0.30,(90,180,180),1)
 
     cv2.putText(p,"E=NS emergency  R=EW emergency  Q=quit",
-                (178,185),cv2.FONT_HERSHEY_SIMPLEX,0.36,(80,80,80),1)
+                (178,155),cv2.FONT_HERSHEY_SIMPLEX,0.36,(80,80,80),1)
+
+    # ── Pedestrian status display ─────────────────────────────────────────────
+    if s["phase"] == "PEDESTRIAN":
+        # Active pedestrian phase — bright banner
+        cv2.rectangle(p, (110,165), (530,195), (0,140,0), -1)
+        cv2.putText(p, "PEDESTRIAN CROSSING — ALL VEHICLES STOPPED",
+                    (118,185), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1)
+
+    elif s.get("ped_pending"):
+        # Button pressed, waiting for safe gap — yellow warning
+        dirs = ', '.join(sorted(s.get("ped_dirs", []))) or "?"
+        cv2.rectangle(p, (110,165), (530,195), (0,140,140), -1)
+        cv2.putText(p, f"PED BUTTON PRESSED ({dirs}) — waiting for safe gap",
+                    (118,185), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255,255,255), 1)
+
+    elif s.get("ped_recent"):
+        # Just pressed in last 2 seconds but phase not triggered yet — flash
+        cv2.rectangle(p, (110,165), (530,195), (0,80,80), -1)
+        cv2.putText(p, "PED REQUEST RECEIVED — next safe gap",
+                    (145,185), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200,255,255), 1)
+
+    else:
+        # Normal state — show auto pedestrian countdown
+        ped_in = PED_EVERY_N_CYCLES - (s['decisions'] % PED_EVERY_N_CYCLES) \
+                 if s['decisions'] > 0 else PED_EVERY_N_CYCLES
+        cv2.putText(p, f"Auto pedestrian in {ped_in} decision(s) | Press physical button to request now",
+                    (60,183), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (90,90,90), 1)
 
     return p
 
@@ -461,9 +581,13 @@ def main():
         print("[Error] Arduino not found.")
         sys.exit(1)
 
-    arduino = Arduino(port)
-    ai      = NeuralNetworkAI()
-    cycle   = SignalCycle(arduino, ai)
+    arduino   = Arduino(port)
+    ped_queue = PedestrianQueue()
+    arduino.set_button_callback(ped_queue.press)
+    print("[Buttons] Pedestrian buttons active: A0=North A1=South A2=East A3=West")
+
+    ai    = NeuralNetworkAI()
+    cycle = SignalCycle(arduino, ai, ped_queue)
 
     det_n = Detector("North")
     det_s = Detector("South")
